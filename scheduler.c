@@ -1,9 +1,12 @@
 #include <stdlib.h>
 #include <stdio.h>
-#include <setjmp.h>
 #include <ucontext.h>
+#include <signal.h>
+#include <stddef.h>
 
 #include "sc_collections.h"
+
+#define STACK_SIZE (16 * 1024)
 
 struct task {
 	/*
@@ -45,6 +48,7 @@ enum {
 	EXIT_TASK,
 };
 
+//定义调度器结构体
 struct scheduler_private {
 	/*
 	 * Where to jump back to perform scheduler actions
@@ -60,7 +64,11 @@ struct scheduler_private {
 	 * A list of all tasks.
 	 */
 	struct sc_list_head task_list;
+	int status;
 } priv;
+
+// 全局变量
+ucontext_t main_context;
 
 //初始化调度权，清空任务列表，设置当前任务为null
 void scheduler_init(void)
@@ -73,21 +81,37 @@ void scheduler_init(void)
 void scheduler_create_task(void (*func)(void *), void *arg)
 {
 	static int id = 1;
-	struct task *task = malloc(sizeof(*task));
-	task->status = ST_CREATED;
-	task->func = func;
-	task->arg = arg;
-	task->id = id++;
-	task->stack_size = 16 * 1024;
-	task->stack_bottom = malloc(task->stack_size);
-	task->stack_top = task->stack_bottom + task->stack_size;
-	sc_list_insert_end(&priv.task_list, &task->task_list);
+    struct task *task = malloc(sizeof(*task));
+    if (!task) {
+        perror("malloc");
+        exit(EXIT_FAILURE);
+    }
+    task->status = ST_CREATED;
+    task->func = func;
+    task->arg = arg;
+    task->id = id++;
+    task->stack_bottom = malloc(STACK_SIZE);
+    if (!task->stack_bottom) {
+        perror("malloc");
+        exit(EXIT_FAILURE);
+    }
+    if (getcontext(&task->context) == -1) {
+        perror("getcontext");
+        exit(EXIT_FAILURE);
+    }
+    task->context.uc_stack.ss_sp = task->stack_bottom;
+    task->context.uc_stack.ss_size = STACK_SIZE;
+    task->context.uc_stack.ss_flags = 0;
+    task->context.uc_link = &priv.context;
+
+    sc_list_insert_end(&priv.task_list, &task->task_list);
 }
 
 //退出当前任务
 void scheduler_exit_current_task(void)
 {
 	struct task *task = priv.current;
+	if (!task) return;
 	//任务列表中移除当前任务
 	sc_list_remove(&task->task_list);
 	/* Would love to free the task... but if we do, we won't have a
@@ -96,7 +120,7 @@ void scheduler_exit_current_task(void)
 	//通过Longjmp跳回调度器，并且把返回值设置为EXIT_TASK
 	// 保存当前任务的上下文并切换到调度器上下文
     // 使用 swapcontext 来实现上下文切换
-    if (swapcontext(&task->context, &priv.scheduler_context) == -1) {
+    if (swapcontext(&task->context, &priv.context) == -1) {
         perror("swapcontext");
         exit(EXIT_FAILURE);
     }
@@ -122,7 +146,6 @@ static struct task *scheduler_choose_task(void)
 			return task;
 		}
 	}
-
 	return NULL;
 }
 
@@ -142,18 +165,12 @@ static void schedule(void)
 		 * pointer, run the task, and exit it at the end.
 		 * 初始化并运行新的任务，设置任务的上下文
 		 */
-		if (getcontext(&next->context) == -1) {
-            perror("getcontext");
-            exit(EXIT_FAILURE);
-        }
-		// 设置任务函数
-        makecontext(&next->context, (void (*)())next->func, 1, next->arg);
-
 		/*
 		 * Run the task function
 		 */
 		next->status = ST_RUNNING;
-
+		// 设置任务函数
+        makecontext(&next->context, (void (*)())next->func, 1, next->arg);
 		/*
 		 * The stack pointer should be back where we set it. Returning would be
 		 * a very, very bad idea. Let's instead exit
@@ -177,23 +194,14 @@ static void schedule(void)
 //主动放弃cpu，保存当前任务状态，跳转回调度器
 void scheduler_relinquish(void)
 {
-	/* if (setjmp(priv.current->buf)) {
-		return;
-	} else {
-		//需要用ucontext()来实现
-		longjmp(priv.buf, SCHEDULE);
-	} */
-	// 获取当前任务的上下文并保存
-    if (getcontext(&priv.current->context) == 0) {
-        // 保存当前任务上下文成功，进行上下文切换
-        // 保存调度器的上下文并切换到调度器上下文
-        if (swapcontext(&priv.current->context, &priv.scheduler_context) == -1) {
-            perror("swapcontext");
-            exit(EXIT_FAILURE);
-        }
-    } else {
-        // 任务上下文被恢复时的处理，这里直接返回
-        return;
+	if (getcontext(&priv.current->context) == -1) {
+        perror("getcontext");
+        exit(EXIT_FAILURE);
+    }
+
+    if (swapcontext(&priv.current->context, &priv.context) == -1) {
+        perror("swapcontext");
+        exit(EXIT_FAILURE);
     }
 }
 
@@ -201,42 +209,56 @@ void scheduler_relinquish(void)
 static void scheduler_free_current_task(void)
 {
 	struct task *task = priv.current;
-	priv.current = NULL;
+	if (!task) return;
+
 	free(task->stack_bottom);
 	free(task);
+	priv.current = NULL;
 }
 
 //启动调度器循环
 void scheduler_run(void)
 {
-	if(getcontext(&priv.context) == 0){
+	if(getcontext(&priv.context) == -1){
 		//初次调用getcontext返回0，相当于INIT状态
-		priv.context.uc_stack.ss_sp = malloc(SIGSTKSZ);
-		priv.text.uc_stack.ss_size = SIGSTKSZ;
-        priv.context.uc_link = &main_context; 
-		// 返回上下文
-		// 设置要执行的函数和参数，这里简化为 schedule
-        makecontext(&priv.context, (void (*)())schedule, 0);
-
-        // 切换到调度器上下文，相当于 setjmp 之后进入 SCHEDULE
-        swapcontext(&main_context, &priv.context);
-		} else {
-        // 后续从 setcontext 恢复时的处理
-        int status = main_context.uc_mcontext.gregs[REG_RDI];
-        switch (status) {
-            case EXIT_TASK:
-                scheduler_free_current_task();
-                // 没有 break, 跌入到 INIT 继续执行
-            case INIT:
-            case SCHEDULE:
-                // 重新调度，类似 setjmp 的 case 逻辑
-                schedule();
-                // 如果 schedule 返回，则直接退出
-                return;
-            default:
-                fprintf(stderr, "调度出错！\n");
-                return;
-        }
+		perror("getcontext");
+        exit(EXIT_FAILURE);
 	}
+	priv.context.uc_stack.ss_sp = malloc(STACK_SIZE);
+    if (!priv.context.uc_stack.ss_sp) {
+        perror("malloc");
+        exit(EXIT_FAILURE);
+    }
+	priv.context.uc_stack.ss_size = STACK_SIZE;
+	priv.context.uc_stack.ss_flags = 0;
+    priv.context.uc_link = &main_context; 
+	// 返回上下文
+	// 设置要执行的函数和参数，这里简化为 schedule
+    makecontext(&priv.context, (void (*)())schedule, 0);
 
+    // 切换到调度器上下文，相当于 setjmp 之后进入 SCHEDULE
+    if (swapcontext(&main_context, &priv.context) == -1) {
+    perror("swapcontext");
+    exit(EXIT_FAILURE);
+    }
+
+        // 后续从 setcontext 恢复时的处理
+
+        //int status = main_context.uc_mcontext.gregs[REG_RDI];
+    switch (priv.status) {
+        case EXIT_TASK:
+            scheduler_free_current_task();
+            // 没有 break, 跌入到 INIT 继续执行
+			__attribute__((fallthrough));
+        case INIT:
+        case SCHEDULE:
+            // 重新调度，类似 setjmp 的 case 逻辑
+            schedule();
+            // 如果 schedule 返回，则直接退出
+            return;
+        default:
+            fprintf(stderr, "调度出错！\n");
+            break;
+    }
 }
+

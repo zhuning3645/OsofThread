@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <ucontext.h>
 
+#include "sc_collections.h"
 #include "scheduler.h"
 
 struct tester_args {
@@ -34,6 +35,8 @@ void create_test_task(char *name, int iters)
 
 int main(int argc, char **argv)
 {
+	(void)argc; 
+    (void)argv;
 	scheduler_init();
 	create_test_task("first", 5);
 	create_test_task("second", 2);
