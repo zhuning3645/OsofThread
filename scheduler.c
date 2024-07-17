@@ -40,6 +40,13 @@ struct task {
 	void *stack_bottom;
 	void *stack_top;
 	int stack_size;
+	//互斥锁
+	struct mutex mutex;
+};
+
+struct mutex {
+	int locked;
+	struct sc_list_head wait_list;
 };
 
 enum {
@@ -260,5 +267,36 @@ void scheduler_run(void)
             fprintf(stderr, "调度出错！\n");
             break;
     }
+}
+
+//互斥锁初始化
+void mutex_init(struct mutex *mutex) {
+	mutex->locked = 0;
+	sc_list_init(&mutex->wait_list);
+}
+
+//加锁操作
+void mutex_lock(struct mutex *mutex) {
+	struct task *self = priv.current;
+	sc_list_add_tail(&self->task_list, &mutex->wait_list);
+
+	while (__sync_val_compare_and_swap(&mutex->locked, 0, 1) != 0) {
+		// 如果锁被其他任务持有，当前任务需要等待
+		scheduler_relinquish(); // 放弃CPU
+	}
+
+	// 锁成功获取，从等待队列中移除
+	sc_list_remove(&self->task_list);
+}
+
+//解锁操作
+void mutex_unlock(struct mutex *mutex) {
+	__sync_fetch_and_and(&mutex->locked, 0); // 解锁
+	if (!sc_list_empty(&mutex->wait_list)) {
+		// 如果有任务在等待，唤醒队列中的第一个任务
+		struct task *next = sc_list_first_entry(&mutex->wait_list, struct task, task_list);
+		sc_list_remove(&next->task_list);
+		scheduler_schedule(next); // 唤醒任务
+	}
 }
 
